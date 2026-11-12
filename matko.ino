@@ -1,102 +1,135 @@
 /*
-  UNO WiFi Rev2: 4 physical buttons + 4 LEDs + passive piezo buzzer
-  and a responsive local web dashboard.
+  Arduino Oscillo Lab - Arduino UNO WiFi Rev2
+  - Creates its own WiFi access point, no router required
+  - D8-D11: automatic LED patterns, no physical-button controls
+  - D6: passive piezo buzzer / square-wave measurement output
+  - Web UI: 24 musical notes, custom frequency, 3 original melodies, STOP
 
   Wiring:
-    Button outputs -> D2, D3, D4, D5 (each button closes to GND)
-    LEDs (each with 220-330 ohm resistor) -> D8, D9, D10, D11, cathodes -> GND
-    Passive piezo (+) -> D6, (-) -> GND
+    LED anodes -> through individual 220-330 ohm resistors -> D8,D9,D10,D11
+    LED cathodes -> GND
+    Passive piezo + -> D6, - -> GND
+    Scope probe tip -> D6, probe ground -> Arduino GND
 
-  Physical buttons: LED stays on only while pressed; press = short note.
-  Web buttons: toggle the corresponding LED on/off; enabling = short note.
-  All 4 physical buttons together: toggle PARTY MODE.
-  Web PARTY button: toggle PARTY MODE.
-  In PARTY MODE, the lighting animation and original melody loop until stopped.
-
-  WiFi: Arduino itself creates a WPA2 access point. No router needed.
-  Install 'WiFiNINA' and Arduino megaAVR Boards; select Arduino Uno WiFi Rev2.
+  Libraries: WiFiNINA (Library Manager), Arduino megaAVR Boards
+  Board: Arduino Uno WiFi Rev2
 */
+
 #include <SPI.h>
 #include <WiFiNINA.h>
+#include <avr/pgmspace.h>
+#include <string.h>
+#include <stdlib.h>
 
-// Arduino creates this WiFi network. Change password before use!
-char ssid[] = "ArduinoParty";
-char pass[] = "arduino1234";  // Minimum 8 characters
+char ssid[] = "OscilloLab";
+char pass[] = "osciloskop123"; // at least 8 characters
+WiFiServer server(80);
 
-const uint8_t BUTTON_PINS[4] = {2, 3, 4, 5};
 const uint8_t LED_PINS[4] = {8, 9, 10, 11};
 const uint8_t BUZZER_PIN = 6;
-const uint16_t BUTTON_NOTES[4] = {262, 330, 392, 523};
-const uint16_t SONG[16] = {
-  523, 659, 784, 1047, 988, 784, 659, 523,
-  392, 523, 659, 784, 1047, 784, 1047, 1319
+
+struct Step {
+  uint16_t hz;
+  uint16_t ms;
 };
 
-WiFiServer server(80);
-bool webOn[4] = {false, false, false, false};
-bool pressed[4] = {false, false, false, false};
-bool rawPrevious[4] = {false, false, false, false};
-bool ledState[4] = {false, false, false, false};
-unsigned long buttonChangedAt[4] = {0, 0, 0, 0};
-bool allFourLatch = false;
-bool party = false;
-uint8_t partyStep = 0;
-unsigned long partyLastStepAt = 0;
+// Three original small test tunes; 0 Hz means a deliberate pause.
+const Step SONG0[] PROGMEM = {
+  {262, 260}, {330, 260}, {392, 260}, {523, 460},
+  {392, 240}, {330, 240}, {294, 240}, {262, 560},
+  {0, 150}, {392, 220}, {523, 220}, {659, 360},
+  {523, 260}, {392, 260}, {330, 260}, {262, 650}
+};
+const Step SONG1[] PROGMEM = {
+  {440, 200}, {880, 200}, {660, 200}, {1320, 220},
+  {550, 200}, {1100, 200}, {440, 240}, {0, 130},
+  {523, 200}, {1047, 200}, {784, 230}, {1568, 260},
+  {659, 240}, {880, 240}, {1047, 490}
+};
+const Step SONG2[] PROGMEM = {
+  {220, 400}, {330, 400}, {440, 400}, {660, 400},
+  {880, 650}, {0, 200}, {880, 240}, {660, 240},
+  {440, 240}, {330, 240}, {220, 700}
+};
 
-void setParty(bool enabled) {
-  party = enabled;
-  partyStep = 0;
-  partyLastStepAt = millis();
-  if (party) tone(BUZZER_PIN, SONG[0], 130);
+const uint8_t SONG_LENGTHS[3] = {
+  sizeof(SONG0) / sizeof(SONG0[0]),
+  sizeof(SONG1) / sizeof(SONG1[0]),
+  sizeof(SONG2) / sizeof(SONG2[0])
+};
+
+// 0: silent, 1: sustained note, 2: preset melody.
+uint8_t audioMode = 0;
+uint16_t currentHz = 0;
+uint8_t activeSong = 255;
+uint8_t songStep = 0;
+unsigned long songNextAt = 0;
+
+void stopSound() {
+  audioMode = 0;
+  currentHz = 0;
+  activeSong = 255;
+  songStep = 0;
+  noTone(BUZZER_PIN);
+}
+
+void startNote(uint16_t hz) {
+  if (hz < 50 || hz > 5000) return;
+  stopSound();
+  audioMode = 1;
+  currentHz = hz;
+  tone(BUZZER_PIN, hz); // Sustained signal until STOP (best for oscilloscope)
+}
+
+void startMelody(uint8_t id) {
+  if (id >= 3) return;
+  stopSound();
+  audioMode = 2;
+  activeSong = id;
+  songStep = 0;
+  songNextAt = 0;
+}
+
+void updateAudio() {
+  if (audioMode != 2) return;
+  unsigned long now = millis();
+  if (songNextAt != 0 && (long)(now - songNextAt) < 0) return;
+  if (songStep >= SONG_LENGTHS[activeSong]) {
+    stopSound();
+    return;
+  }
+
+  Step note;
+  if (activeSong == 0) memcpy_P(&note, &SONG0[songStep], sizeof(note));
+  else if (activeSong == 1) memcpy_P(&note, &SONG1[songStep], sizeof(note));
+  else memcpy_P(&note, &SONG2[songStep], sizeof(note));
+
+  currentHz = note.hz;
+  if (note.hz) tone(BUZZER_PIN, note.hz);
   else noTone(BUZZER_PIN);
-}
-
-void readPhysicalButtons() {
-  unsigned long now = millis();
-  for (uint8_t i = 0; i < 4; i++) {
-    bool raw = digitalRead(BUTTON_PINS[i]) == LOW;
-    if (raw != rawPrevious[i]) {
-      rawPrevious[i] = raw;
-      buttonChangedAt[i] = now;
-    }
-    // Small debounce, so a single press does not create repeated triggers.
-    if (now - buttonChangedAt[i] >= 25 && pressed[i] != raw) {
-      pressed[i] = raw;
-      if (pressed[i] && !party) tone(BUZZER_PIN, BUTTON_NOTES[i], 100);
-    }
-  }
-
-  bool allFour = pressed[0] && pressed[1] && pressed[2] && pressed[3];
-  if (allFour && !allFourLatch) setParty(!party);
-  allFourLatch = allFour;
-}
-
-void updateParty() {
-  if (!party) return;
-  unsigned long now = millis();
-  if (now - partyLastStepAt >= 165) {
-    partyLastStepAt = now;
-    partyStep = (partyStep + 1) % 24;
-    tone(BUZZER_PIN, SONG[partyStep % 16], 125);
-  }
+  songNextAt = now + note.ms;
+  ++songStep;
 }
 
 void updateLEDs() {
-  for (uint8_t i = 0; i < 4; i++) {
-    if (!party) {
-      ledState[i] = webOn[i] || pressed[i];
-    } else if (partyStep < 12) {  // Running lights
-      ledState[i] = (i == partyStep % 4);
-    } else if (partyStep < 20) {  // Alternating pairs
-      ledState[i] = ((i + partyStep) % 2 == 0);
-    } else {                     // Strobe
-      ledState[i] = (partyStep % 2 == 0);
-    }
-    digitalWrite(LED_PINS[i], ledState[i] ? HIGH : LOW);
+  // Always-on autonomous light show. Intentionally independent of the web UI.
+  unsigned long now = millis();
+  uint16_t section = (now / 5000UL) % 3;
+  uint8_t step = 0;
+  if (section == 0) step = (now / 140UL) % 4;         // running light
+  else if (section == 1) step = (now / 230UL) % 2;    // alternating pairs
+  else step = (now / 85UL) % 2;                      // fast flash
+
+  for (uint8_t i = 0; i < 4; ++i) {
+    bool on = false;
+    if (section == 0) on = (i == step);
+    else if (section == 1) on = ((i % 2) == step);
+    else on = (step == 0);
+    digitalWrite(LED_PINS[i], on ? HIGH : LOW);
   }
 }
 
-void sendHeaders(WiFiClient &client, bool json) {
+void sendHeaders(WiFiClient& client, bool json) {
   client.println(F("HTTP/1.1 200 OK"));
   if (json) client.println(F("Content-Type: application/json; charset=utf-8"));
   else client.println(F("Content-Type: text/html; charset=utf-8"));
@@ -105,145 +138,156 @@ void sendHeaders(WiFiClient &client, bool json) {
   client.println();
 }
 
-void sendStatus(WiFiClient &client) {
+void sendStatus(WiFiClient& client) {
   sendHeaders(client, true);
-  client.print(F("{\"party\":"));
-  client.print(party ? '1' : '0');
-  client.print(F(",\"web\":["));
-  for (uint8_t i = 0; i < 4; i++) {
-    if (i) client.print(',');
-    client.print(webOn[i] ? '1' : '0');
-  }
-  client.print(F("],\"pressed\":["));
-  for (uint8_t i = 0; i < 4; i++) {
-    if (i) client.print(',');
-    client.print(pressed[i] ? '1' : '0');
-  }
-  client.print(F("],\"led\":["));
-  for (uint8_t i = 0; i < 4; i++) {
-    if (i) client.print(',');
-    client.print(ledState[i] ? '1' : '0');
-  }
-  client.println(F("]}"));
+  client.print(F("{\"mode\":")); client.print(audioMode);
+  client.print(F(",\"hz\":")); client.print(currentHz);
+  client.print(F(",\"song\":"));
+  client.print(audioMode == 2 ? activeSong : 255);
+  client.println(F("}"));
 }
 
-// The HTML page lives in flash, not the 6 KB data RAM.
-const char HTML_PAGE[] PROGMEM = R"PAGE(<!doctype html><html lang="sk"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#0b0b16"><title>UNO Light Control</title>
+// Stored in program flash instead of the UNO WiFi Rev2's limited SRAM.
+const char PAGE[] PROGMEM = R"HTML(<!doctype html>
+<html lang="sk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0d1019"><title>Oscillo Lab | Arduino</title>
 <style>
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at 50% -10%,#25204c 0,#0b0b16 55%);color:#f7f6ff;font-family:system-ui,-apple-system,Segoe UI,sans-serif;min-height:100vh}
-main{max-width:750px;margin:auto;padding:38px 20px 60px}.top{display:flex;justify-content:space-between;align-items:center;gap:12px}.chip{font-size:11px;font-weight:850;letter-spacing:2px;color:#a9a2ff;background:#24203d;padding:9px 13px;border:1px solid #39305e;border-radius:99px}.net{font-size:12px;color:#8f8ca7}.net:before{content:'●';color:#54f0a3;margin-right:7px}h1{font-size:clamp(34px,7vw,56px);line-height:1.03;margin:34px 0 12px;letter-spacing:-2px}.intro{color:#a2a0b6;font-size:15px;margin-bottom:28px;line-height:1.5}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:14px}.tile{appearance:none;border:1px solid #302e49;background:#19182a;border-radius:22px;text-align:left;color:inherit;padding:21px;min-height:176px;cursor:pointer;transition:.18s transform,.18s border-color,.18s background}.tile:active{transform:scale(.97)}.tile.on{border-color:#8277c6;background:#232039}.tile:disabled{opacity:.55;cursor:default}.orb{display:block;width:57px;height:57px;border-radius:50%;background:var(--c);opacity:.25;box-shadow:0 0 0 6px #ffffff04;transition:.2s}.tile.on .orb{opacity:1;box-shadow:0 0 22px 5px var(--glow),0 0 0 7px #ffffff09}.nm{display:block;margin-top:17px;font-weight:750;font-size:16px}.small{display:block;margin-top:5px;font-size:12px;color:#a09cb6}
-.party{margin-top:22px;width:100%;border:1px solid #7d66e5;border-radius:20px;padding:20px 18px;background:linear-gradient(115deg,#7050db,#462fb0);color:#fff;text-align:left;cursor:pointer;display:flex;justify-content:space-between;align-items:center;gap:10px}.party strong{font-size:19px;letter-spacing:.3px}.party small{display:block;opacity:.78;margin-top:5px}.party.active{background:linear-gradient(115deg,#ce3bcf,#6329db);box-shadow:0 0 27px #9738dc55;animation:pulse 1.2s infinite alternate}@keyframes pulse{to{box-shadow:0 0 42px #bc3df188}}.ico{font-size:28px}.hint{margin-top:24px;color:#77738e;font-size:12px;line-height:1.7}.err{color:#ff8699!important}.footer{margin-top:34px;color:#68637b;font-size:11px}
-</style></head><body><main><div class="top"><span class="chip">UNO / WIFI REV2</span><span id="net" class="net">Pripája sa...</span></div>
-<h1>Light Control<span style="color:#967dff">.</span></h1><p class="intro">Štyri svetlá, štyri tóny. Ovládaj ich z mobilu alebo fyzickými tlačidlami.</p>
-<div class="grid">
-<button class="tile" id="b0" onclick="toggle(0)" style="--c:#f6f7ff;--glow:#f6f7ff66"><span class="orb"></span><span class="nm">Biela</span><span class="small" id="s0">Vypnutá</span></button>
-<button class="tile" id="b1" onclick="toggle(1)" style="--c:#ff4a66;--glow:#ff4a6680"><span class="orb"></span><span class="nm">Červená</span><span class="small" id="s1">Vypnutá</span></button>
-<button class="tile" id="b2" onclick="toggle(2)" style="--c:#ffe04d;--glow:#ffe04d88"><span class="orb"></span><span class="nm">Žltá</span><span class="small" id="s2">Vypnutá</span></button>
-<button class="tile" id="b3" onclick="toggle(3)" style="--c:#4e9fff;--glow:#4e9fff88"><span class="orb"></span><span class="nm">Modrá</span><span class="small" id="s3">Vypnutá</span></button>
-</div><button class="party" id="party" onclick="partyToggle()"><span><strong>✦ PARTY MODE</strong><small id="pt">Spusti svetelnú show + melódiu</small></span><span class="ico">♫</span></button>
-<p class="hint">Klikni na farbu a prepni LED. Fyzické tlačidlá fungujú tiež. Keď stlačíš všetky štyri naraz, PARTY MODE sa prepne.</p><div class="footer">AP MODE · WiFiNINA · UNO WiFi Rev2</div></main>
-<script>
-let state={party:0,web:[0,0,0,0],pressed:[0,0,0,0],led:[0,0,0,0]};
-let busy=false;
-async function command(path){if(busy)return;busy=true;try{const r=await fetch(path,{cache:'no-store'});if(!r.ok)throw Error();state=await r.json();paint()}catch(e){offline()}finally{busy=false}}
-function toggle(i){if(!state.party)command('/toggle?i='+i)}
-function partyToggle(){command('/party')}
-function paint(){document.getElementById('net').textContent='Online · Arduino WiFi';document.getElementById('net').classList.remove('err');for(let i=0;i<4;i++){const b=document.getElementById('b'+i);b.classList.toggle('on',!!state.led[i]);b.disabled=!!state.party;document.getElementById('s'+i).textContent=state.party?'Party efekt':state.pressed[i]?'Fyzicky stlačené':state.web[i]?'Zapnutá':'Vypnutá'}document.getElementById('party').classList.toggle('active',!!state.party);document.getElementById('pt').textContent=state.party?'Hrá sa! Klikni pre vypnutie':'Spusti svetelnú show + melódiu'}
-function offline(){const x=document.getElementById('net');x.textContent='Arduino nedostupné';x.classList.add('err')}
-async function refresh(){if(busy)return;try{const r=await fetch('/status',{cache:'no-store'});if(!r.ok)throw Error();state=await r.json();paint()}catch(e){offline()}}
-setInterval(refresh,700);refresh();
-</script></body></html>)PAGE";
+:root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top left,#22324e 0,#101522 38%,#080c14 100%);color:#eaf0f9;font:15px system-ui,Segoe UI,Arial,sans-serif;min-height:100vh}
+main{max-width:820px;padding:26px 16px 60px;margin:auto}.top{display:flex;align-items:center;justify-content:space-between;gap:12px}.tag{color:#9bffcf;background:#16443855;border:1px solid #39785e;border-radius:99px;padding:7px 11px;font-size:11px;font-weight:800;letter-spacing:1.4px}.online{font-size:12px;color:#b1bdd5}
+h1{font-size:clamp(34px,7vw,58px);letter-spacing:-2px;margin:25px 0 8px;line-height:1.07}h1 span{color:#70f4ba}p{color:#9baac3;line-height:1.55;margin:0 0 22px}
+.panel{border:1px solid #2b374d;background:#121a29e8;border-radius:20px;margin:16px 0;padding:20px;box-shadow:0 10px 35px #0002}.ph{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:14px;flex-wrap:wrap}h2{font-size:17px;margin:0}.hint{color:#8c9cb5;font-size:12px}
+.readout{border:1px solid #3a6857;border-radius:16px;background:#0d271f;margin-bottom:20px;padding:17px;display:flex;align-items:center;justify-content:space-between;gap:8px}.readout .digit{font-variant-numeric:tabular-nums;font-size:clamp(25px,7vw,39px);letter-spacing:-1px;font-weight:800;color:#80ffb7}.readout small{color:#9bb8a9;display:block;margin-bottom:3px;font-size:11px;text-transform:uppercase;letter-spacing:1px}.pill{border:1px solid #47745d;background:#16392b;border-radius:10px;padding:8px;color:#baffd2;font-size:11px}
+.keys{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px}.key{background:#222f41;border:1px solid #3a4861;color:#eef6ff;border-radius:12px;min-height:58px;cursor:pointer;font-size:13px;font-weight:780;transition:background .1s,transform .1s}.key:active,.key.active{background:#286a57;border-color:#7cf6b4;transform:scale(.98)}.key.sharp{background:#141a28;color:#c4cee1}.key.sharp.active{background:#286a57}.key small{display:block;color:#94a2ba;font-size:10px;font-weight:500;margin-top:4px}.key.active small{color:#c6ffe2}
+.freq{display:flex;gap:9px;align-items:stretch;flex-wrap:wrap}input{background:#09111f;border:1px solid #3a4861;border-radius:12px;padding:12px;color:#fff;font-size:17px;min-width:0;width:150px;flex:1}.btn{background:#317b65;color:white;border:1px solid #52ae8c;border-radius:12px;padding:12px 16px;font-weight:800;cursor:pointer}.btn:active{transform:scale(.98)}.btn.stop{background:#552e39;border-color:#b7687c}.melodies{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px}.melodies .btn{background:#25354d;border-color:#405b81;min-height:65px}.melodies .btn.active{background:#225d48;border-color:#7af9b9}
+footer{font-size:12px;color:#71819b;line-height:1.6;padding:12px 3px}.waves{width:100%;height:42px;margin-top:11px;opacity:.55}@media(max-width:520px){.keys{grid-template-columns:repeat(4,minmax(0,1fr))}.melodies{grid-template-columns:1fr}.panel{padding:15px}}
+</style></head><body><main>
+<div class="top"><span class="tag">ARDUINO · OSCILLO LAB</span><span id="conn" class="online">Pripájam sa...</span></div>
+<h1>Sound <span>Lab.</span></h1><p>LEDky blikajú samy. Ty cez web generuješ tóny a sleduješ priebeh na osciloskope.</p>
+<div class="readout"><div><small>Frekvencia na pine D6</small><div class="digit" id="hz">0 Hz</div><small id="status">Ticho</small></div><span class="pill">SQUARE WAVE<br>~50% DUTY</span></div>
+<div class="panel"><div class="ph"><h2>Hudobné noty</h2><span class="hint">C4 až B5 · tón hrá až do STOP</span></div><div id="keys" class="keys"></div></div>
+<div class="panel"><div class="ph"><h2>Vlastná frekvencia</h2><span class="hint">50 – 5000 Hz</span></div><div class="freq"><input id="freq" type="number" min="50" max="5000" value="440" step="1" aria-label="Frekvencia v Hz"><button class="btn" onclick="customFreq()">▶ Generovať</button><button class="btn stop" onclick="command('/api/stop')">■ STOP</button></div><p style="font-size:12px;margin:14px 0 0">Skús 100 Hz, 440 Hz alebo 1000 Hz. Na osciloskope uvidíš rozdiel v perióde.</p></div>
+<div class="panel"><div class="ph"><h2>Testovacie melódie</h2><span class="hint">Vlastné krátke sekvencie</span></div><div class="melodies"><button class="btn" id="song0" onclick="command('/api/melody?id=0')">♪ Vzostup a návrat</button><button class="btn" id="song1" onclick="command('/api/melody?id=1')">♫ Dvojité frekvencie</button><button class="btn" id="song2" onclick="command('/api/melody?id=2')">♬ Pomalé schody</button></div><p style="font-size:12px;margin:13px 0 0">Pri melódii sa frekvencia postupne mení. STOP funguje okamžite po doručení požiadavky.</p></div>
+<footer>Pripojenie: hrot sondy na D6, uzemnenie sondy na GND. Signál je digitálny približne 0–5 V, nie sínusovka. Prehrávanie vyžaduje pasívny piezo bzučiak.</footer>
+</main><script>
+const notes=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const keys=document.getElementById('keys');let busy=false, state={mode:0,hz:0,song:255};
+for(let octave=4;octave<=5;octave++)for(let i=0;i<12;i++){
+ const midi=(octave+1)*12+i,hz=Math.round(440*Math.pow(2,(midi-69)/12));
+ const b=document.createElement('button');b.className='key'+(notes[i].includes('#')?' sharp':'');b.id='n'+hz;b.innerHTML=notes[i]+octave+'<small>'+hz+' Hz</small>';b.onclick=()=>command('/api/tone?hz='+hz);keys.appendChild(b);
+}
+async function command(path){try{busy=true;const r=await fetch(path,{cache:'no-store'});if(!r.ok)throw Error('HTTP');state=await r.json();paint()}catch(e){offline()}finally{busy=false}}
+function customFreq(){let hz=Number(document.getElementById('freq').value);if(!Number.isInteger(hz)||hz<50||hz>5000){alert('Zadaj frekvenciu 50 až 5000 Hz.');return}command('/api/tone?hz='+hz)}
+function paint(){document.getElementById('conn').textContent='● Pripojené k Arduinu';document.getElementById('hz').textContent=state.hz+' Hz';document.getElementById('status').textContent=state.mode===0?'Ticho':state.mode===1?'Trvalý tón (do STOP)':'Prehráva sa melódia';document.querySelectorAll('.key').forEach(b=>b.classList.toggle('active',state.mode===1&&b.id==='n'+state.hz));for(let i=0;i<3;i++)document.getElementById('song'+i).classList.toggle('active',state.mode===2&&state.song===i)}
+function offline(){document.getElementById('conn').textContent='● Spojenie prerušené'}
+async function poll(){if(busy)return;try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw Error('HTTP');state=await r.json();paint()}catch(e){offline()}}
+setInterval(poll,900);poll();
+</script></body></html>)HTML";
 
-void sendPage(WiFiClient &client) {
+void sendPage(WiFiClient& client) {
   sendHeaders(client, false);
-  // Send in small blocks so WiFiNINA does not have to send each char
-  // over SPI separately; preserve the tiny SRAM of the Uno WiFi Rev2.
-  const uint16_t total = strlen_P(HTML_PAGE);
-  char chunk[96];
-  for (uint16_t offset = 0; offset < total; offset += sizeof(chunk)) {
-    uint8_t count = ((total - offset) < sizeof(chunk))
-                     ? (uint8_t)(total - offset)
-                     : (uint8_t)sizeof(chunk);
-    for (uint8_t i = 0; i < count; i++) {
-      chunk[i] = (char)pgm_read_byte(HTML_PAGE + offset + i);
-    }
-    client.write((const uint8_t*)chunk, count);
+  const uint16_t total = strlen_P(PAGE);
+  char buf[96];
+  for (uint16_t offset = 0; offset < total; offset += sizeof(buf)) {
+    uint8_t n = ((total - offset) < sizeof(buf)) ? (uint8_t)(total - offset) : (uint8_t)sizeof(buf);
+    for (uint8_t i = 0; i < n; ++i) buf[i] = (char)pgm_read_byte(PAGE + offset + i);
+    client.write((const uint8_t*)buf, n);
+    updateAudio();
+    updateLEDs();
   }
 }
 
-void handleClient(WiFiClient &client) {
-  // Read the first HTTP request line only. No heap-heavy String allocation.
-  char request[72];
-  uint8_t pos = 0;
-  unsigned long start = millis();
-  while (client.connected() && millis() - start < 700) {
+void serveClient(WiFiClient& client) {
+  char request[96];
+  uint8_t n = 0;
+  unsigned long started = millis();
+  while (client.connected() && millis() - started < 650UL) {
+    if (!client.available()) {
+      updateAudio();
+      updateLEDs();
+      continue;
+    }
+    char ch = (char)client.read();
+    if (ch == '\n') break;
+    if (ch != '\r' && n < sizeof(request) - 1) request[n++] = ch;
+  }
+  request[n] = '\0';
+  // Consume the remaining HTTP headers before replying. Closing a TCP
+  // connection with unread request data can make browsers report a reset.
+  uint8_t lineEndCount = 0;
+  unsigned long headerStart = millis();
+  while (client.connected() && millis() - headerStart < 600UL) {
     if (client.available()) {
       char ch = (char)client.read();
-      if (ch == '\n') break;
-      if (ch != '\r' && pos < sizeof(request) - 1) request[pos++] = ch;
+      if (ch == '\n') {
+        if (++lineEndCount >= 2) break;
+      } else if (ch != '\r') {
+        lineEndCount = 0;
+      }
     }
+    updateAudio();
+    updateLEDs();
   }
-  request[pos] = '\0';
-
-  if (strncmp(request, "GET /toggle?i=", 14) == 0 &&
-      request[14] >= '0' && request[14] <= '3') {
-    uint8_t i = request[14] - '0';
-    if (!party) {
-      webOn[i] = !webOn[i];
-      if (webOn[i]) tone(BUZZER_PIN, BUTTON_NOTES[i], 110);
+  if (strncmp(request, "GET /api/tone?", 14) == 0) {
+    const char* p = strstr(request, "hz=");
+    if (p) {
+      long hz = atol(p + 3);
+      if (hz >= 50 && hz <= 5000) startNote((uint16_t)hz);
     }
-    updateLEDs();
     sendStatus(client);
-  } else if (strncmp(request, "GET /party", 10) == 0) {
-    setParty(!party);
-    updateLEDs();
+  } else if (strncmp(request, "GET /api/melody?", 16) == 0) {
+    const char* p = strstr(request, "id=");
+    if (p) {
+      int id = atoi(p + 3);
+      if (id >= 0 && id <= 2) startMelody((uint8_t)id);
+    }
+    updateAudio();
     sendStatus(client);
-  } else if (strncmp(request, "GET /status", 11) == 0) {
+  } else if (strncmp(request, "GET /api/stop", 13) == 0) {
+    stopSound();
+    sendStatus(client);
+  } else if (strncmp(request, "GET /api/status", 15) == 0) {
     sendStatus(client);
   } else {
     sendPage(client);
   }
-  delay(2);
+  delay(1);
   client.stop();
 }
 
 void setup() {
   Serial.begin(115200);
-  for (uint8_t i = 0; i < 4; i++) {
-    pinMode(BUTTON_PINS[i], INPUT_PULLUP);
+  for (uint8_t i = 0; i < 4; ++i) {
     pinMode(LED_PINS[i], OUTPUT);
     digitalWrite(LED_PINS[i], LOW);
   }
   pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
 
   if (WiFi.status() == WL_NO_MODULE) {
-    Serial.println(F("CHYBA: WiFi modul nebol najdeny. Skontroluj typ dosky."));
-    while (true) delay(1000);
+    Serial.println(F("ERROR: WiFiNINA module not found"));
+    while (true) {
+      updateLEDs();
+    }
   }
-  Serial.println(F("Vytvaram vlastnu Arduino WiFi siet..."));
+
+  Serial.println(F("Starting local WiFi access point..."));
   int status = WiFi.beginAP(ssid, pass);
-  if (status != WL_AP_LISTENING && status != WL_AP_CONNECTED) {
-    Serial.println(F("CHYBA: WiFi AP sa nepodarilo vytvorit."));
-    Serial.println(F("Over heslo (min. 8 znakov) a firmware WiFiNINA."));
-    while (true) delay(1000);
+  if (status != WL_AP_LISTENING) {
+    Serial.println(F("ERROR: could not start AP. Check WiFiNINA firmware."));
+    while (true) {
+      updateLEDs();
+    }
   }
-  delay(200);
+  delay(800);
   server.begin();
-  Serial.print(F("NAZOV WIFI: "));
-  Serial.println(ssid);
-  Serial.print(F("HESLO WIFI: "));
-  Serial.println(pass);
-  Serial.print(F("OTVOR V MOBILE: http://"));
-  Serial.println(WiFi.localIP());
+  Serial.print(F("Network: ")); Serial.println(ssid);
+  Serial.print(F("Password: ")); Serial.println(pass);
+  Serial.print(F("Open: http://")); Serial.println(WiFi.localIP());
 }
 
 void loop() {
-  readPhysicalButtons();
-  updateParty();
   updateLEDs();
+  updateAudio();
   WiFiClient client = server.available();
-  if (client) handleClient(client);
+  if (client) serveClient(client);
 }
