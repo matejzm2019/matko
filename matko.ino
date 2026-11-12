@@ -13,15 +13,15 @@
   Web PARTY button: toggle PARTY MODE.
   In PARTY MODE, the lighting animation and original melody loop until stopped.
 
-  WiFi: 2.4 GHz WPA/WPA2 router; phone and UNO must be on same local network.
+  WiFi: Arduino itself creates a WPA2 access point. No router needed.
   Install 'WiFiNINA' and Arduino megaAVR Boards; select Arduino Uno WiFi Rev2.
 */
 #include <SPI.h>
 #include <WiFiNINA.h>
 
-// !!! FILL IN YOUR WI-FI CREDENTIALS !!!
-char ssid[] = "MOJA_WIFI";
-char pass[] = "MOJE_HESLO";
+// Arduino creates this WiFi network. Change password before use!
+char ssid[] = "ArduinoParty";
+char pass[] = "arduino1234";  // Minimum 8 characters
 
 const uint8_t BUTTON_PINS[4] = {2, 3, 4, 5};
 const uint8_t LED_PINS[4] = {8, 9, 10, 11};
@@ -144,14 +144,14 @@ main{max-width:750px;margin:auto;padding:38px 20px 60px}.top{display:flex;justif
 <button class="tile" id="b2" onclick="toggle(2)" style="--c:#ffe04d;--glow:#ffe04d88"><span class="orb"></span><span class="nm">Žltá</span><span class="small" id="s2">Vypnutá</span></button>
 <button class="tile" id="b3" onclick="toggle(3)" style="--c:#4e9fff;--glow:#4e9fff88"><span class="orb"></span><span class="nm">Modrá</span><span class="small" id="s3">Vypnutá</span></button>
 </div><button class="party" id="party" onclick="partyToggle()"><span><strong>✦ PARTY MODE</strong><small id="pt">Spusti svetelnú show + melódiu</small></span><span class="ico">♫</span></button>
-<p class="hint">Klikni na farbu a prepni LED. Fyzické tlačidlá fungujú tiež. Keď stlačíš všetky štyri naraz, PARTY MODE sa prepne.</p><div class="footer">LOCAL CONTROL · WiFiNINA · Arduino UNO WiFi Rev2</div></main>
+<p class="hint">Klikni na farbu a prepni LED. Fyzické tlačidlá fungujú tiež. Keď stlačíš všetky štyri naraz, PARTY MODE sa prepne.</p><div class="footer">AP MODE · WiFiNINA · UNO WiFi Rev2</div></main>
 <script>
 let state={party:0,web:[0,0,0,0],pressed:[0,0,0,0],led:[0,0,0,0]};
 let busy=false;
 async function command(path){if(busy)return;busy=true;try{const r=await fetch(path,{cache:'no-store'});if(!r.ok)throw Error();state=await r.json();paint()}catch(e){offline()}finally{busy=false}}
 function toggle(i){if(!state.party)command('/toggle?i='+i)}
 function partyToggle(){command('/party')}
-function paint(){document.getElementById('net').textContent='Online · lokálna sieť';document.getElementById('net').classList.remove('err');for(let i=0;i<4;i++){const b=document.getElementById('b'+i);b.classList.toggle('on',!!state.led[i]);b.disabled=!!state.party;document.getElementById('s'+i).textContent=state.party?'Party efekt':state.pressed[i]?'Fyzicky stlačené':state.web[i]?'Zapnutá':'Vypnutá'}document.getElementById('party').classList.toggle('active',!!state.party);document.getElementById('pt').textContent=state.party?'Hrá sa! Klikni pre vypnutie':'Spusti svetelnú show + melódiu'}
+function paint(){document.getElementById('net').textContent='Online · Arduino WiFi';document.getElementById('net').classList.remove('err');for(let i=0;i<4;i++){const b=document.getElementById('b'+i);b.classList.toggle('on',!!state.led[i]);b.disabled=!!state.party;document.getElementById('s'+i).textContent=state.party?'Party efekt':state.pressed[i]?'Fyzicky stlačené':state.web[i]?'Zapnutá':'Vypnutá'}document.getElementById('party').classList.toggle('active',!!state.party);document.getElementById('pt').textContent=state.party?'Hrá sa! Klikni pre vypnutie':'Spusti svetelnú show + melódiu'}
 function offline(){const x=document.getElementById('net');x.textContent='Arduino nedostupné';x.classList.add('err')}
 async function refresh(){if(busy)return;try{const r=await fetch('/status',{cache:'no-store'});if(!r.ok)throw Error();state=await r.json();paint()}catch(e){offline()}}
 setInterval(refresh,700);refresh();
@@ -223,12 +223,19 @@ void setup() {
     Serial.println(F("CHYBA: WiFi modul nebol najdeny. Skontroluj typ dosky."));
     while (true) delay(1000);
   }
-  Serial.println(F("Pripajam sa k 2.4 GHz WiFi..."));
-  while (WiFi.begin(ssid, pass) != WL_CONNECTED) {
-    Serial.println(F("WiFi nepripojena, skusam znovu o 5 sekund..."));
-    delay(5000);
+  Serial.println(F("Vytvaram vlastnu Arduino WiFi siet..."));
+  int status = WiFi.beginAP(ssid, pass);
+  if (status != WL_AP_LISTENING && status != WL_AP_CONNECTED) {
+    Serial.println(F("CHYBA: WiFi AP sa nepodarilo vytvorit."));
+    Serial.println(F("Over heslo (min. 8 znakov) a firmware WiFiNINA."));
+    while (true) delay(1000);
   }
+  delay(200);
   server.begin();
+  Serial.print(F("NAZOV WIFI: "));
+  Serial.println(ssid);
+  Serial.print(F("HESLO WIFI: "));
+  Serial.println(pass);
   Serial.print(F("OTVOR V MOBILE: http://"));
   Serial.println(WiFi.localIP());
 }
